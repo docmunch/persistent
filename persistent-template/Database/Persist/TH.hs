@@ -18,6 +18,8 @@ module Database.Persist.TH
     , mpsBackend
     , mpsGeneric
     , mpsPrefixFields
+    , mpsEntityJSON
+    , EntityJSON, entityToJSON, entityFromJSON
     , mkPersistSettings
     , sqlSettings
     , sqlOnlySettings
@@ -28,12 +30,16 @@ module Database.Persist.TH
     , share
     , derivePersistField
     , persistFieldFromEntity
+      -- * Internal
+    , packPTH
+    , lensPTH
     ) where
 
 import Prelude hiding ((++), take, concat, splitAt)
 import Database.Persist
 import Database.Persist.Sql (Migration, SqlPersistT, migrate, SqlBackend, PersistFieldSql)
 import Database.Persist.Quasi
+import Language.Haskell.TH.Lib (varE)
 import Language.Haskell.TH.Quote
 import Language.Haskell.TH.Syntax
 import Data.Char (toLower, toUpper)
@@ -47,14 +53,14 @@ import Data.List (foldl', find)
 import Data.Maybe (isJust)
 import Data.Monoid (mappend, mconcat)
 import qualified Data.Map as M
+import qualified Data.HashMap.Strict as HM
 import Data.Aeson
     ( ToJSON (toJSON), FromJSON (parseJSON), (.=), object
     , Value (Object), (.:), (.:?)
     )
-import Control.Applicative (pure, (<*>), liftA2)
+import Control.Applicative (pure, (<*>))
 import Control.Monad.Logger (MonadLogger)
 import Database.Persist.Sql (sqlType)
-import Language.Haskell.TH.Instances ()
 
 -- | Converts a quasi-quoted syntax into a list of entity definitions, to be
 -- used as input to the template haskell generation code (mkPersist).
@@ -89,16 +95,16 @@ parseSqlType ps s =
   where
     defsOrig = parse ps s
 
-getSqlType :: [EntityDef ()] -> EntityDef () -> EntityDef DelayedSqlTypeExp
+getSqlType :: [EntityDef ()] -> EntityDef () -> EntityDef SqlTypeExp
 getSqlType allEntities ent =
     ent
         { entityFields = map go $ entityFields ent
         }
   where
-    go :: FieldDef () -> FieldDef DelayedSqlTypeExp
+    go :: FieldDef () -> FieldDef SqlTypeExp
     go field = do
         field
-            { fieldSqlType = DSTE final
+            { fieldSqlType = final
             , fieldEmbedded = mEmbedded (fieldType field)
             }
       where
@@ -136,13 +142,6 @@ getSqlType allEntities ent =
         typedNothing = SigE (ConE 'Nothing) mtyp
         st = VarE 'sqlType `AppE` typedNothing
 
-
-data DelayedSqlTypeExp = DSTE { unDSTE :: SqlTypeExp }
-instance Lift DelayedSqlTypeExp where
-    lift (DSTE SqlString') = return $ ConE 'SqlString'
-    lift (DSTE SqlInt64') = return $ ConE 'SqlInt64'
-    lift (DSTE (SqlTypeExp e)) = liftA2 AppE (return $ ConE 'SqlTypeExp) (lift e)
-
 data SqlTypeExp = SqlTypeExp Exp
                 | SqlString'
                 | SqlInt64'
@@ -153,7 +152,7 @@ instance Lift SqlTypeExp where
 
 -- | Create data types and appropriate 'PersistEntity' instances for the given
 -- 'EntityDef's. Works well with the persist quasi-quoter.
-mkPersist :: MkPersistSettings -> [EntityDef SqlTypeExp] -> Q [Dec]
+mkPersist :: MkPersistSettings -> [EntityDef SqlType] -> Q [Dec]
 mkPersist mps ents' = do
     x <- fmap mconcat $ mapM (persistFieldFromEntity mps) ents
     y <- fmap mconcat $ mapM (mkEntity mps) ents
@@ -185,6 +184,23 @@ data MkPersistSettings = MkPersistSettings
     -- True.
     , mpsPrefixFields :: Bool
     -- ^ Prefix field names with the model name. Default: True.
+    , mpsEntityJSON :: Maybe EntityJSON
+    -- ^ Generate @ToJSON@/@FromJSON@ instances for each model types. If it's
+    -- @Nothing@, no instances will be generated. Default:
+    --
+    -- @
+    --  Just EntityJSON
+    --      { entityToJSON = 'keyValueEntityToJSON
+    --      , entityFromJSON = 'keyValueEntityFromJSON
+    --      }
+    -- @
+    }
+
+data EntityJSON = EntityJSON
+    { entityToJSON :: Name
+    -- ^ Name of the @toJSON@ implementation for @Entity a@.
+    , entityFromJSON :: Name
+    -- ^ Name of the @fromJSON@ implementation for @Entity a@.
     }
 
 -- | Create an @MkPersistSettings@ with default values.
@@ -194,6 +210,10 @@ mkPersistSettings t = MkPersistSettings
     { mpsBackend = t
     , mpsGeneric = True -- FIXME switch default to False in the future
     , mpsPrefixFields = True
+    , mpsEntityJSON = Just EntityJSON
+        { entityToJSON = 'keyValueEntityToJSON
+        , entityFromJSON = 'keyValueEntityFromJSON
+        }
     }
 
 -- | Use the 'SqlPersist' backend.
@@ -491,12 +511,12 @@ mkFromPersistValues mps t@(EntityDef { entitySum = True }) = do
 
 type Lens s t a b = forall f. Functor f => (a -> f b) -> s -> f t
 
-lens :: (s -> a) -> (s -> b -> t) -> Lens s t a b
-lens sa sbt afb s = fmap (sbt s) (afb $ sa s)
+lensPTH :: (s -> a) -> (s -> b -> t) -> Lens s t a b
+lensPTH sa sbt afb s = fmap (sbt s) (afb $ sa s)
 
 mkLensClauses :: MkPersistSettings -> EntityDef a -> Q [Clause]
 mkLensClauses mps t = do
-    lens' <- [|lens|]
+    lens' <- [|lensPTH|]
     getId <- [|entityKey|]
     setId <- [|\(Entity _ value) key -> Entity key value|]
     getVal <- [|entityVal|]
@@ -547,7 +567,7 @@ mkLensClauses mps t = do
             ]
             $ ConE 'Entity `AppE` VarE keyName `AppE` (ConE (sumConstrName mps t f) `AppE` VarE xName)
 
-mkEntity :: MkPersistSettings -> EntityDef SqlTypeExp -> Q [Dec]
+mkEntity :: MkPersistSettings -> EntityDef SqlType -> Q [Dec]
 mkEntity mps t = do
     t' <- lift t
     let nameT = unHaskellName $ entityHaskell t
@@ -562,7 +582,7 @@ mkEntity mps t = do
         { fieldHaskell = HaskellName "Id"
         , fieldDB = entityID t
         , fieldType = FTTypeCon Nothing $ unHaskellName (entityHaskell t) ++ "Id"
-        , fieldSqlType = SqlInt64'
+        , fieldSqlType = SqlInt64
         , fieldEmbedded = Nothing
         , fieldAttrs = []
         , fieldStrict = True
@@ -618,10 +638,15 @@ mkEntity mps t = do
 --
 -- instance PersistEntity e => PersistField e where
 --    toPersistValue = PersistMap $ zip columNames (map toPersistValue . toPersistFields)
---    fromPersistValue (PersistMap o) = fromPersistValues $ map (\(_,v) ->
---        casefromPersistValue v of
---            Left e -> error e
---            Right r -> r) o
+--    fromPersistValue (PersistMap o) = 
+--        let columns = HM.fromList x
+--        in fromPersistValues $ map (\name ->
+--          case HM.lookup name o of
+--            Just v ->
+--              case fromPersistValue v of
+--                Left e -> error e
+--                Right r -> r
+--            Nothing -> error $ "Missing field: " `mappend` unpack name) columnNames 
 --    fromPersistValue x = Left $ "Expected PersistMap, received: " ++ show x
 --    sqlType _ = SqlString
 persistFieldFromEntity :: MkPersistSettings -> EntityDef a -> Q [Dec]
@@ -629,9 +654,14 @@ persistFieldFromEntity mps e = do
     ss <- [|SqlString|]
     let columnNames = map (unpack . unHaskellName . fieldHaskell) (entityFields e)
     obj <- [|\ent -> PersistMap $ zip (map pack columnNames) (map toPersistValue $ toPersistFields ent)|]
-    fpv <- [|\x -> fromPersistValues $ map (\(_,v) -> case fromPersistValue v of
-                                                      Left e' -> error $ unpack e'
-                                                      Right r -> r) x|]
+    fpv <- [|\x -> let columns = HM.fromList x
+                   in fromPersistValues $ map (\name -> 
+                                                  case HM.lookup name columns of
+                                                      Just v -> 
+                                                          case fromPersistValue v of
+                                                              Left e' -> error $ unpack e'
+                                                              Right r -> r
+                                                      Nothing -> error $ "Missing field: " `mappend` unpack name) (map pack columnNames)|]
     let typ = genericDataType mps (pack entityName) $ VarT $ mkName "backend"
 
     compose <- [|(<=<)|]
@@ -873,17 +903,15 @@ instance Lift' () where
     lift' () = [|()|]
 instance Lift' SqlTypeExp where
     lift' = lift
-instance Lift' DelayedSqlTypeExp where
-    lift' = lift
 
-pack' :: String -> Text
-pack' = pack
+packPTH :: String -> Text
+packPTH = pack
 #if !MIN_VERSION_text(0, 11, 2)
-{-# NOINLINE pack' #-}
+{-# NOINLINE packPTH #-}
 #endif
 
 liftT :: Text -> Q Exp
-liftT t = [|pack' $(lift (unpack t))|]
+liftT t = [|packPTH $(lift (unpack t))|]
 
 liftTs :: [Text] -> Q Exp
 liftTs = fmap ListE . mapM liftT
@@ -933,8 +961,8 @@ instance Lift SqlType where
     lift (SqlNumeric x y) =
         [|SqlNumeric (fromInteger x') (fromInteger y')|]
       where
-        x' = fromIntegral x
-        y' = fromIntegral y
+        x' = fromIntegral x :: Integer
+        y' = fromIntegral y :: Integer
     lift SqlBool = [|SqlBool|]
     lift SqlDay = [|SqlDay|]
     lift SqlTime = [|SqlTime|]
@@ -949,7 +977,7 @@ instance Lift SqlType where
 -- forall . typ ~ FieldType => EntFieldName
 --
 -- EntFieldName = FieldDef ....
-mkField :: MkPersistSettings -> EntityDef a -> FieldDef SqlTypeExp -> Q (Con, Clause)
+mkField :: MkPersistSettings -> EntityDef a -> FieldDef SqlType -> Q (Con, Clause)
 mkField mps et cd = do
     let con = ForallC
                 []
@@ -1054,4 +1082,13 @@ mkJSON mps def = do
             (Just $ VarE obj)
             (if nullable (fieldAttrs f) == Nullable ByMaybeAttr then dotColonQE else dotColonE)
             (Just $ AppE packE $ LitE $ StringL $ unpack $ unHaskellName $ fieldHaskell f)
-    return [toJSONI, fromJSONI]
+    case mpsEntityJSON mps of
+        Nothing -> return [toJSONI, fromJSONI]
+        Just entityJSON -> do
+            entityJSONIs <- [d|
+                instance ToJSON (Entity $(pure typ)) where
+                    toJSON = $(varE (entityToJSON entityJSON))
+                instance FromJSON (Entity $(pure typ)) where
+                    parseJSON = $(varE (entityFromJSON entityJSON))
+                |]
+            return $ toJSONI : fromJSONI : entityJSONIs
