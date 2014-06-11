@@ -18,8 +18,9 @@ import Control.Monad.IO.Class
 import Data.ByteString.Char8 (readInteger)
 import Data.Maybe (isJust)
 import Data.List (find)
+import Control.Monad.Trans.Resource (MonadResource)
 
-instance (C.MonadResource m, MonadLogger m) => PersistStore (SqlPersistT m) where
+instance (MonadResource m, MonadLogger m) => PersistStore (SqlPersistT m) where
     type PersistMonadBackend (SqlPersistT m) = SqlBackend
     insert val = do
         conn <- askSqlConn
@@ -89,12 +90,14 @@ instance (C.MonadResource m, MonadLogger m) => PersistStore (SqlPersistT m) wher
         let composite = isJust $ entityPrimary t
         let cols = T.intercalate ","
                  $ map (connEscapeName conn . fieldDB) $ entityFields t
+            noColumns :: Bool
+            noColumns = null $ entityFields t
         let wher = case entityPrimary t of
                      Just pdef -> T.intercalate " AND " $ map (\fld -> connEscapeName conn (snd fld) <> "=? ") $ primaryFields pdef
                      Nothing   -> connEscapeName conn (entityID t) <> "=?"
         let sql = T.concat
                 [ "SELECT "
-                , cols
+                , if noColumns then "*" else cols
                 , " FROM "
                 , connEscapeName conn $ entityDB t
                 , " WHERE "
@@ -105,7 +108,7 @@ instance (C.MonadResource m, MonadLogger m) => PersistStore (SqlPersistT m) wher
             case res of
                 Nothing -> return Nothing
                 Just vals ->
-                    case fromPersistValues vals of
+                    case fromPersistValues $ if noColumns then [] else vals of
                         Left e -> error $ "get " ++ show (unKey k) ++ ": " ++ unpack e
                         Right v -> return $ Just v
 

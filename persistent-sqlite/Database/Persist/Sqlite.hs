@@ -34,6 +34,8 @@ import Control.Applicative
 import Data.Int (Int64)
 import Control.Monad ((>=>))
 import Data.Monoid ((<>))
+import Control.Monad.Trans.Control (MonadBaseControl)
+import Control.Monad.Trans.Resource (ResourceT, MonadResource, runResourceT)
 
 createSqlitePool :: MonadIO m => Text -> Int -> m ConnectionPool
 createSqlitePool s = createSqlPool $ open' s
@@ -123,11 +125,15 @@ insertSql' ent vals =
           ins = T.concat
               [ "INSERT INTO "
               , escape $ entityDB ent
-              , "("
-              , T.intercalate "," $ map (escape . fieldDB) $ entityFields ent
-              , ") VALUES("
-              , T.intercalate "," (map (const "?") $ entityFields ent)
-              , ")"
+              , if null (entityFields ent)
+                    then " VALUES(null)"
+                    else T.concat
+                      [ "("
+                      , T.intercalate "," $ map (escape . fieldDB) $ entityFields ent
+                      , ") VALUES("
+                      , T.intercalate "," (map (const "?") $ entityFields ent)
+                      , ")"
+                      ]
               ]
 
 execute' :: Sqlite.Connection -> Sqlite.Statement -> [PersistValue] -> IO Int64

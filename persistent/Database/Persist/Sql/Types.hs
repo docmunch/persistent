@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -10,6 +11,9 @@ module Database.Persist.Sql.Types where
 
 import Control.Exception (Exception)
 import Control.Monad.Trans.Resource (MonadResource (..), MonadThrow (..), ResourceT)
+#if MIN_VERSION_exceptions(0,6,0)
+import Control.Monad.Catch (MonadCatch, MonadMask)
+#endif
 import Control.Monad.Logger (MonadLogger (..), NoLoggingT)
 import Control.Monad.Trans.Control
 import Control.Monad.Trans.Class (MonadTrans (..))
@@ -28,7 +32,7 @@ import Data.IORef (IORef)
 import Data.Map (Map)
 import Data.Int (Int64)
 import Data.Conduit (Source)
-import Data.Conduit.Pool (Pool)
+import Data.Pool (Pool)
 import Web.PathPieces
 import Control.Exception (throw)
 import qualified Data.Text.Read
@@ -86,15 +90,31 @@ data SqlBackend
     deriving Typeable
 
 newtype SqlPersistT m a = SqlPersistT { unSqlPersistT :: ReaderT Connection m a }
-    deriving (Monad, MonadIO, MonadTrans, Functor, Applicative, MonadPlus)
+    deriving (Monad, MonadIO, MonadTrans, Functor, Applicative, MonadPlus
+#if MIN_VERSION_exceptions(0,6,0)
+#if MIN_VERSION_resourcet(1,1,0)
+        , MonadThrow
+        , MonadCatch
+        , MonadMask
+#endif
+#endif
+    )
 
 type SqlPersist = SqlPersistT
 {-# DEPRECATED SqlPersist "Please use SqlPersistT instead" #-}
 
 type SqlPersistM = SqlPersistT (NoLoggingT (ResourceT IO))
 
+#if MIN_VERSION_resourcet(1,1,0)
+#if !MIN_VERSION_exceptions(0,6,0)
+instance MonadThrow m => MonadThrow (SqlPersistT m) where
+    throwM = lift . throwM
+#endif
+
+#else
 instance MonadThrow m => MonadThrow (SqlPersistT m) where
     monadThrow = lift . monadThrow
+#endif
 
 instance MonadBase backend m => MonadBase backend (SqlPersistT m) where
     liftBase = lift . liftBase

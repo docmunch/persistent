@@ -18,6 +18,7 @@
 module PersistentTest where
 
 import Test.HUnit hiding (Test)
+import Control.Monad.Trans.Resource (runResourceT)
 import Test.Hspec.Expectations ()
 import Test.Hspec.QuickCheck(prop)
 
@@ -25,7 +26,7 @@ import Database.Persist
 
 #ifdef WITH_MONGODB
 import qualified Database.MongoDB as MongoDB
-import Database.Persist.MongoDB (oidToKey, toInsertFields, docToEntityThrow, MongoBackend, collectionName, entityToDocument)
+import Database.Persist.MongoDB (oidToKey, toInsertDoc, docToEntityThrow, MongoBackend, collectionName, entityToDocument)
 import Data.Bson (genObjectId)
 import Language.Haskell.TH.Syntax (Type(..))
 
@@ -74,6 +75,7 @@ import qualified Data.Conduit.List as CL
 import Data.Functor.Identity
 import Data.Functor.Constant
 import PersistTestPetType
+import PersistTestPetCollarType
 
 #ifdef WITH_MONGODB
 mkPersist (mkPersistSettings $ ConT ''MongoBackend) [persistUpperCase|
@@ -116,6 +118,10 @@ share [mkPersist sqlSettings,  mkMigrate "testMigrate", mkDeleteCascade sqlSetti
     -- Indented comment
   NeedsPet
     petKey PetId
+  OutdoorPet
+    ownerId PersonId
+    collar PetCollar
+    type PetType
 
   -- From the scaffold
   User
@@ -157,6 +163,7 @@ cleanDB = do
   deleteWhere ([] :: [Filter Pet])
   deleteWhere ([] :: [Filter MaybeOwnedPet])
   deleteWhere ([] :: [Filter NeedsPet])
+  deleteWhere ([] :: [Filter OutdoorPet])
   deleteWhere ([] :: [Filter User])
   deleteWhere ([] :: [Filter Email])
 
@@ -601,6 +608,12 @@ specs = describe "persistent" $ do
       Just dog' <- get dog
       liftIO $ petType dog' @?= Dog
 
+  it "derivePersistFieldJSON" $ db $ do
+      let mittensCollar = PetCollar "Mittens\n1-714-668-9672" True
+      person <- insert $ Person "pet owner" 30 Nothing
+      catKey <- insert $ OutdoorPet person mittensCollar Cat
+      Just (OutdoorPet _ collar' _) <- get catKey
+      liftIO $ collar' @?= mittensCollar
 
   it "idIn" $ db $ do
       let p1 = Person "D" 0 Nothing
@@ -630,7 +643,7 @@ specs = describe "persistent" $ do
 
     it "toInsertFields, entityFields, & docToEntityThrow" $ db $ do
         let p1 = Person "Duder" 0 Nothing
-        let doc = toInsertFields p1
+        let doc = toInsertDoc p1
         MongoDB.ObjId _id <- MongoDB.insert "Person" $ doc
         let idSelector = "_id" MongoDB.=: _id
         Entity _ ent1 <- docToEntityThrow $ idSelector:doc
