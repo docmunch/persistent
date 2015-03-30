@@ -116,6 +116,7 @@ import qualified Database.Persist.Sql as Sql
 import qualified Control.Monad.IO.Class as Trans
 import Control.Exception (throw, throwIO)
 import Data.Acquire (mkAcquire)
+import qualified Data.Foldable as Foldable
 import qualified Data.Traversable as Traversable
 
 import Data.Bson (ObjectId(..))
@@ -206,7 +207,8 @@ instance FromJSON NoOrphanPortID where
     parseJSON _ = fail "couldn't parse port number"
 
 
-data Connection = Connection DB.Pipe DB.Database
+data Connection = Connection DB.Pipe (Maybe (DB.Pipe)) DB.Database
+
 type ConnectionPool = Pool.Pool Connection
 
 -- | ToPathPiece is used to convert a key to/from text
@@ -262,9 +264,11 @@ createPipe hostname port = DB.connect (DB.Host hostname port)
 
 createReplicatSet :: (DB.ReplicaSetName, [DB.Host]) -> Database -> Maybe MongoAuth -> IO Connection
 createReplicatSet rsSeed dbname mAuth = do
-    pipe <- DB.openReplicaSet rsSeed >>= DB.primary
-    testAccess pipe dbname mAuth
-    return $ Connection pipe dbname
+    rs <- DB.openReplicaSet rsSeed
+    pipe1 <- DB.primary rs
+    pipe2 <- DB.secondaryOk rs
+    testAccess pipe1 (Just pipe2) dbname mAuth
+    return $ Connection pipe1 (Just pipe2) dbname
 
 createRsPool :: (Trans.MonadIO m, Applicative m) => Database -> ReplicaSetConfig
               -> Maybe MongoAuth
@@ -275,23 +279,28 @@ createRsPool :: (Trans.MonadIO m, Applicative m) => Database -> ReplicaSetConfig
 createRsPool dbname (ReplicaSetConfig rsName rsHosts) mAuth connectionPoolSize stripeSize connectionIdleTime = do
     Trans.liftIO $ Pool.createPool
                           (createReplicatSet (rsName, rsHosts) dbname mAuth)
-                          (\(Connection pipe _) -> DB.close pipe)
+                          closeConnection
                           connectionPoolSize
                           connectionIdleTime
                           stripeSize
 
-testAccess :: DB.Pipe -> Database -> Maybe MongoAuth -> IO ()
-testAccess pipe dbname mAuth = do
+testAccess :: DB.Pipe -> Maybe DB.Pipe -> Database -> Maybe MongoAuth -> IO ()
+testAccess pipe1 mPipe2 dbname mAuth = do
     _ <- case mAuth of
-      Just (MongoAuth user pass) -> DB.access pipe DB.UnconfirmedWrites dbname (DB.auth user pass)
+      Just (MongoAuth user pass) -> DB.access pipe1 mPipe2 DB.UnconfirmedWrites dbname (DB.auth user pass)
       Nothing -> return undefined
     return ()
 
 createConnection :: Database -> HostName -> PortID -> Maybe MongoAuth -> IO Connection
 createConnection dbname hostname port mAuth = do
     pipe <- createPipe hostname port
-    testAccess pipe dbname mAuth
-    return $ Connection pipe dbname
+    testAccess pipe Nothing dbname mAuth
+    return $ Connection pipe Nothing dbname
+
+closeConnection :: Connection -> IO ()
+closeConnection (Connection pipe1 mPipe2 _) = do
+    DB.close pipe1
+    Foldable.mapM_ DB.close mPipe2
 
 createMongoDBPool :: (Trans.MonadIO m, Applicative m) => Database -> HostName -> PortID
                   -> Maybe MongoAuth
@@ -302,7 +311,7 @@ createMongoDBPool :: (Trans.MonadIO m, Applicative m) => Database -> HostName ->
 createMongoDBPool dbname hostname port mAuth connectionPoolSize stripeSize connectionIdleTime = do
   Trans.liftIO $ Pool.createPool
                           (createConnection dbname hostname port mAuth)
-                          (\(Connection pipe _) -> DB.close pipe)
+                          closeConnection
                           connectionPoolSize
                           connectionIdleTime
                           stripeSize
@@ -352,11 +361,11 @@ withMongoDBPool dbname hostname port mauth poolStripes stripeConnections connect
 -- | run a pool created with 'createMongoDBPipePool'
 runMongoDBPipePool :: (Trans.MonadIO m, MonadBaseControl IO m) => DB.AccessMode -> Database -> DB.Action m a -> PipePool -> m a
 runMongoDBPipePool accessMode db action pool =
-  Pool.withResource pool $ \pipe -> DB.access pipe accessMode db action
+  Pool.withResource pool $ \pipe -> DB.access pipe Nothing accessMode db action
 
 runMongoDBPool :: (Trans.MonadIO m, MonadBaseControl IO m) => DB.AccessMode  -> DB.Action m a -> ConnectionPool -> m a
 runMongoDBPool accessMode action pool =
-  Pool.withResource pool $ \(Connection pipe db) -> DB.access pipe accessMode db action
+  Pool.withResource pool $ \(Connection pipe1 mPipe2 db) -> DB.access pipe1 mPipe2 accessMode db action
 
 
 -- | use default 'AccessMode'
